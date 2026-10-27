@@ -4,8 +4,7 @@ import ServiceManagement
 
 func hasAccessibilityAccess() -> Bool {
     if AXIsProcessTrusted() { return true }
-    // A running process may keep reporting its pre-approval trust state. Verify
-    // the actual API capability too, so approval can take effect without relaunch.
+    // Approval can take effect before the process's cached trust state refreshes.
     let desktop = AXUIElementCreateSystemWide()
     AXUIElementSetMessagingTimeout(desktop, 0.1)
     var focused: CFTypeRef?
@@ -31,35 +30,55 @@ func loginStatusDescription() -> String {
     }
 }
 
+// The installed process has no status item, menu, Dock icon, or recurring UI.
+// Only an explicit first install / --setup invocation may show setup controls.
 final class BackgroundAppDelegate: NSObject, NSApplicationDelegate {
     private var engine: WindowMonitor?
-    private var statusItem: NSStatusItem!
-    private var stateItem: NSMenuItem!
-    private var pauseItem: NSMenuItem!
-    private var loginItem: NSMenuItem!
     private var timer: Timer?
     private var setupWindow: NSWindow?
     private var setupStatus: NSTextField?
-    private var paused = false
-    private var askedForPermission = false
+    private let setup: Bool
     private let smokeTest: Bool
+    private var registrationError: String?
 
-    init(smokeTest: Bool = false) { self.smokeTest = smokeTest }
+    init(setup: Bool = false, smokeTest: Bool = false) {
+        self.setup = setup
+        self.smokeTest = smokeTest
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        makeMenu()
         if smokeTest {
-            showSetup()
-            print("SMOKE: accessory app, menu bar, and setup window created")
+            // Exercise the real silent launch path without registering at login,
+            // requesting permissions, or observing the user's input.
+            reconcilePermission()
+            precondition(engine == nil && setupWindow == nil && NSApp.windows.isEmpty
+                && NSApp.mainMenu == nil && NSApp.activationPolicy() == .accessory)
+            print("SMOKE: background launch without permission; no windows, Dock icon, or app menu")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { NSApp.terminate(nil) }
             return
         }
+        if setup {
+            do {
+                try setStartAtLogin(true)
+            } catch {
+                registrationError = error.localizedDescription
+            }
+            // Save before requesting access: subsequent login launches must stay
+            // silent even if access was denied or later revoked.
+            UserDefaults.standard.set(true, forKey: "installationConfigured")
+        }
         reconcilePermission()
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             self?.reconcilePermission()
         }
-        if !hasAccessibilityAccess() { requestPermission() }
+        if setup && (engine == nil || SMAppService.mainApp.status != .enabled) {
+            showSetup()
+            if !hasAccessibilityAccess() {
+                let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                _ = AXIsProcessTrustedWithOptions(options)
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -67,157 +86,79 @@ final class BackgroundAppDelegate: NSObject, NSApplicationDelegate {
         engine?.stop()
     }
 
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if engine == nil && !paused { showSetup() }
-        return true
-    }
-
-    private func makeMenu() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: "QuitOnClose")
-            button.image?.isTemplate = true
-            button.toolTip = "QuitOnClose"
-        }
-        let menu = NSMenu()
-        stateItem = NSMenuItem(title: "Waiting for Accessibility approval", action: nil, keyEquivalent: "")
-        menu.addItem(stateItem)
-        menu.addItem(.separator())
-        pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
-        pauseItem.target = self
-        menu.addItem(pauseItem)
-        loginItem = NSMenuItem(title: "Start at Login", action: #selector(toggleStartAtLogin), keyEquivalent: "")
-        loginItem.target = self
-        menu.addItem(loginItem)
-        updateLoginItem()
-        let settings = NSMenuItem(title: "Open Permission Settings…", action: #selector(openSettings), keyEquivalent: "")
-        settings.target = self
-        menu.addItem(settings)
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit QuitOnClose", action: #selector(quitApp), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
-        statusItem.menu = menu
-    }
-
-    private func setStatus(_ text: String) {
-        stateItem.title = text
-        statusItem.button?.toolTip = "QuitOnClose — " + text
-        setupStatus?.stringValue = text
-    }
+    // Reopening an already-running helper never brings up an interface.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { false }
 
     private func reconcilePermission() {
-        updateLoginItem()
-        guard !paused else { return }
-        guard hasAccessibilityAccess() else {
+        if smokeTest || !hasAccessibilityAccess() {
             engine?.stop()
             engine = nil
-            setStatus("Waiting for Accessibility approval")
-            if setupWindow == nil { showSetup() }
-            return
+        } else if engine == nil {
+            let candidate = WindowMonitor()
+            if candidate.start() {
+                engine = candidate
+            } else {
+                candidate.stop()
+            }
         }
-        guard engine == nil else { return }
-        let candidate = WindowMonitor()
-        guard candidate.start() else {
-            candidate.stop()
-            setStatus("Waiting for click access — see setup")
-            showSetup(activate: false)
-            setupStatus?.stringValue = "Access is enabled. If this message persists, quit and reopen QuitOnClose."
-            return
+        if engine != nil && SMAppService.mainApp.status == .enabled {
+            setupWindow?.close()
+        } else if engine == nil {
+            setupStatus?.stringValue = "Enable QuitOnClose in the permission list. Setup closes automatically when ready."
+        } else {
+            setupStatus?.stringValue = registrationError.map { "Could not enable login: " + $0 }
+                ?? "Allow QuitOnClose in Login Items to finish setup."
         }
-        engine = candidate
-        setStatus("Running — quit only after last window closes")
-        setupWindow?.close()
     }
 
-    private func requestPermission() {
-        guard !askedForPermission else { return }
-        askedForPermission = true
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-    }
+    private func showSetup() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 250),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Install QuitOnClose"
+        window.isReleasedWhenClosed = false
+        window.center()
+        let title = NSTextField(labelWithString: "Approve once. Then it disappears.")
+        title.font = .boldSystemFont(ofSize: 21)
+        title.frame = NSRect(x: 24, y: 194, width: 452, height: 30)
+        let description = NSTextField(wrappingLabelWithString: """
+        Enable QuitOnClose in macOS's Accessibility permission list
+        (Device Control and Data Access on newer macOS versions).
 
-    private func showSetup(activate: Bool = true) {
-        if setupWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
-                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            window.title = "QuitOnClose"
-            window.isReleasedWhenClosed = false
-            window.center()
-            let title = NSTextField(labelWithString: "One-time permission")
-            title.font = .boldSystemFont(ofSize: 22)
-            title.frame = NSRect(x: 28, y: 245, width: 444, height: 30)
-            let description = NSTextField(wrappingLabelWithString: """
-            Click Open Settings, then turn on QuitOnClose in the permission list.
-
-            It starts automatically after approval and runs without Terminal.
-            Closing a window leaves other windows open. The app quits only
-            after its last window closes. Save/cancel prompts stay normal.
-
-            Use the ⓧ menu-bar button to pause or quit QuitOnClose.
-            """)
-            description.font = .systemFont(ofSize: 13)
-            description.frame = NSRect(x: 28, y: 89, width: 444, height: 146)
-            let status = NSTextField(wrappingLabelWithString: "Waiting for Accessibility approval")
-            status.textColor = .secondaryLabelColor
-            status.font = .systemFont(ofSize: 11)
-            status.frame = NSRect(x: 28, y: 52, width: 444, height: 32)
-            let open = NSButton(title: "Open Settings", target: self, action: #selector(openSettings))
-            open.bezelStyle = .rounded
-            open.keyEquivalent = "\r"
-            open.frame = NSRect(x: 340, y: 14, width: 136, height: 32)
-            let quit = NSButton(title: "Quit", target: self, action: #selector(quitApp))
-            quit.bezelStyle = .rounded
-            quit.frame = NSRect(x: 246, y: 14, width: 88, height: 32)
-            for view in [title, description, status, open, quit] { window.contentView?.addSubview(view) }
-            setupStatus = status
-            setupWindow = window
-        }
-        if activate {
-            setupWindow?.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-        }
+        It runs silently at login. No menu-bar icon, Dock icon, or
+        Terminal window. Closing a window leaves other windows open;
+        the application quits only after its last window closes.
+        """)
+        description.frame = NSRect(x: 24, y: 82, width: 452, height: 104)
+        let status = NSTextField(wrappingLabelWithString: "Enable QuitOnClose in the permission list. Setup closes automatically when ready.")
+        status.font = .systemFont(ofSize: 11)
+        status.textColor = .secondaryLabelColor
+        status.frame = NSRect(x: 24, y: 43, width: 452, height: 33)
+        let permissions = NSButton(title: "Open Permissions", target: self, action: #selector(openSettings))
+        permissions.bezelStyle = .rounded
+        permissions.frame = NSRect(x: 313, y: 8, width: 165, height: 32)
+        permissions.keyEquivalent = "\r"
+        let login = NSButton(title: "Login Items", target: self, action: #selector(openLoginSettings))
+        login.bezelStyle = .rounded
+        login.frame = NSRect(x: 193, y: 8, width: 120, height: 32)
+        for view in [title, description, status, permissions, login] { window.contentView?.addSubview(view) }
+        setupStatus = status
+        setupWindow = window
+        reconcilePermission()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc private func openSettings() {
-        requestPermission()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }
     }
 
-    @objc private func togglePause() {
-        paused.toggle()
-        pauseItem.title = paused ? "Resume" : "Pause"
-        if paused {
-            engine?.stop()
-            engine = nil
-            setStatus("Paused")
-        } else {
-            reconcilePermission()
+    @objc private func openLoginSettings() {
+        if SMAppService.mainApp.status != .enabled {
+            do { try setStartAtLogin(true); registrationError = nil }
+            catch { registrationError = error.localizedDescription }
         }
+        SMAppService.openSystemSettingsLoginItems()
     }
-
-    private func updateLoginItem() {
-        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        loginItem.toolTip = "Start at Login: " + loginStatusDescription()
-    }
-
-    @objc private func toggleStartAtLogin() {
-        if SMAppService.mainApp.status == .requiresApproval {
-            SMAppService.openSystemSettingsLoginItems()
-            return
-        }
-        do {
-            try setStartAtLogin(SMAppService.mainApp.status != .enabled)
-            updateLoginItem()
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "Couldn’t change Start at Login"
-            alert.informativeText = error.localizedDescription
-            alert.runModal()
-        }
-    }
-
-    @objc private func quitApp() { NSApp.terminate(nil) }
 }

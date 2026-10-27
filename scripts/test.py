@@ -19,3 +19,10 @@ executable = build / "WindowMonitorTests"
 subprocess.run(["swiftc", "-module-cache-path", str(ROOT / "build/module-cache"),
                 "-warnings-as-errors", str(source), "-o", str(executable)], check=True)
 subprocess.run([str(executable)], check=True)
+
+source.write_text((ROOT / "Sources/QuitOnClose/Installation.swift").read_text() + "\n"
+                  + (ROOT / "Tests/InstallationTests.swift").read_text())
+executable = build / "InstallationTests"
+subprocess.run(["swiftc", "-module-cache-path", str(ROOT / "build/module-cache"),
+                "-warnings-as-errors", str(source), "-o", str(executable)], check=True)
+subprocess.run([str(executable)], check=True)

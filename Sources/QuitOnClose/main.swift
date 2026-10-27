@@ -22,13 +22,32 @@ if arguments == ["--check"] {
     print("Accessibility access: \(approved ? "enabled" : "disabled")")
     exit(approved ? 0 : 1)
 }
+guard arguments.isEmpty || arguments == ["--setup"] || arguments == ["--smoke-test"] else {
+    report("Usage: QuitOnClose [--setup | --check | --login-status | --enable-login | --disable-login]")
+    exit(2)
+}
 let app = NSApplication.shared
-if let identifier = Bundle.main.bundleIdentifier,
-   let other = NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
-    .first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
-    other.activate(options: [])
+app.setActivationPolicy(.accessory)
+let smokeTest = arguments == ["--smoke-test"]
+if !smokeTest && !Installation.isInstalled() {
+    do { try Installation.installAndLaunch() }
+    catch {
+        let alert = NSAlert()
+        alert.messageText = "Couldn’t install QuitOnClose"
+        alert.informativeText = error.localizedDescription
+        alert.runModal()
+        exit(1)
+    }
+    app.run()
     exit(0)
 }
-let appDelegate = BackgroundAppDelegate(smokeTest: arguments == ["--smoke-test"])
+if !smokeTest, let identifier = Bundle.main.bundleIdentifier,
+   NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+    .contains(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        && $0.bundleURL?.resolvingSymlinksInPath() == Bundle.main.bundleURL.resolvingSymlinksInPath() }) {
+    exit(0)
+}
+let setup = !smokeTest && (arguments == ["--setup"] || !UserDefaults.standard.bool(forKey: "installationConfigured"))
+let appDelegate = BackgroundAppDelegate(setup: setup, smokeTest: smokeTest)
 app.delegate = appDelegate
 app.run()

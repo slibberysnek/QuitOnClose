@@ -1,0 +1,11 @@
+.DS_Store
+build/
+.build/
+*.dSYM/
+*.xcuserstate
+xcuserdata/
+__pycache__/
+*.pyc
+.env
+*.p12
+*.keychain*
